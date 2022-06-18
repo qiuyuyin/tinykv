@@ -15,9 +15,11 @@
 package raft
 
 import (
+    "errors"
+    "fmt"
+
     pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
     "github.com/pingcap/log"
-    "github.com/pkg/errors"
 )
 
 // RaftLog manage the log entries, its struct look like:
@@ -52,8 +54,6 @@ type RaftLog struct {
     // the incoming unstable snapshot, if any.
     // (Used in 2C)
     pendingSnapshot *pb.Snapshot
-
-    // Your Data Here (2A).
 }
 
 // newLog returns log using the given storage. It recovers the log
@@ -74,7 +74,11 @@ func newLog(storage Storage) *RaftLog {
     raftLog.committed = firstIndex - 1
     raftLog.applied = firstIndex - 1
     raftLog.storage = storage
-    raftLog.entries = []pb.Entry{}
+    entries, err := storage.Entries(firstIndex, lastIndex+1)
+    if err != nil {
+        log.Fatal(err.Error())
+    }
+    raftLog.entries = entries
     if err != nil {
         log.Fatal(err.Error())
     }
@@ -86,76 +90,78 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
     // Your Code Here (2C).
+    l.storage.Snapshot()
 }
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-    if len(l.entries) == 0 {
-        return nil
-    } else {
-        return l.entries
+    if l.stabled >= l.LastIndex() {
+        return []pb.Entry{}
     }
+    return l.entries[l.stabled:]
 }
 
 // nextEnts returns all the committed but not applied entries
 func (l *RaftLog) nextEnts() (ents []pb.Entry) {
-    return l.splitEntries(l.applied+1, l.committed+1)
+    // if the entries is null
+    if len(l.entries) == 0 {
+        return
+    }
+    firstIndex := l.entries[0].Index
+    ents = l.entries[l.applied+1-firstIndex : l.committed+1-firstIndex]
+    return
 }
 
 // LastIndex return the last index of the log entries
 func (l *RaftLog) LastIndex() uint64 {
-    if len(l.entries) == 0 {
-        index, err := l.storage.LastIndex()
-        if err != nil {
-            panic(err)
-        }
-        return index
-
+    if l.lenEntries() > 0 {
+        return l.entries[0].Index + l.lenEntries() - 1
     } else {
-        return l.stabled + uint64(len(l.entries))
+
+        // find it from snap
+        lastIndex, _ := l.storage.LastIndex()
+        return lastIndex
+    }
+}
+
+// lenEntries return the length of entries
+func (l *RaftLog) lenEntries() uint64 {
+    return uint64(len(l.entries))
+}
+
+// Term return the term of the entry in the given index
+func (l *RaftLog) splitEntries(i uint64) (ents []pb.Entry) {
+    if l.lenEntries() == 0 {
+        return
+    } else {
+        index := i - l.entries[0].Index
+        ents = l.entries[index:]
+        return
     }
 }
 
 // Term return the term of the entry in the given index
-// this i would be in [lastIndex,LastIndex]
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-    // Your Code Here (2A).
-    firstIndex, err := l.storage.FirstIndex()
-    if err != nil {
-        return 0, err
+    if i == 0 {
+        return 0, nil
     }
-    if i < firstIndex || i > l.LastIndex() {
-        return 0, errors.New("index beyond the range")
+    if l.lenEntries() == 0 {
+        term, _ := l.storage.Term(i)
+        return term, nil
     }
-    // if the index is in the stable area, we should search in the storage
-    if i <= l.stabled {
-        return l.storage.Term(i)
-    } else {
-        return l.entries[i-l.stabled-1].Term, nil
+    if i >= l.entries[0].Index+l.lenEntries() || i < l.entries[0].Index {
+        return 0, errors.New("beyond the range")
     }
-
-}
-
-// splitEntries slice the log Entries in the range of [lo,hi)
-func (l *RaftLog) splitEntries(lo uint64, hi uint64) []pb.Entry {
-    if lo <= hi || hi-1 > l.LastIndex() {
-        return nil
-    }
-    if lo > l.stabled {
-        if hi-lo <= uint64(len(l.entries)) {
-            return l.entries[lo:]
-        } else {
-            return l.entries[lo:hi]
-        }
-    } else if hi-1 <= l.stabled {
-        entries, err := l.storage.Entries(lo, hi)
+    if l.lenEntries() == 0 {
+        term, err := l.storage.Term(i)
         if err != nil {
-            return nil
+            return 0, nil
         }
-        return entries
+        return term, nil
     } else {
-        entries := l.splitEntries(lo, l.stabled+1)
-        splitEntries := l.splitEntries(l.stabled+1, hi)
-        return append(entries, splitEntries...)
+        if i-l.entries[0].Index > 1000 {
+            fmt.Println(i)
+        }
+        return l.entries[i-l.entries[0].Index].Term, nil
     }
 }
