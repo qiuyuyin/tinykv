@@ -172,11 +172,18 @@ func newRaft(c *Config) *Raft {
         panic(err.Error())
     }
 
+    state, confState, err := c.Storage.InitialState()
     peers := map[uint64]*Progress{}
-    for _, peer := range c.peers {
-        peers[peer] = &Progress{}
+
+    if c.peers == nil {
+        c.peers = confState.Nodes
     }
     raftLog := newLog(c.Storage)
+    for i, _ := range c.peers {
+        peers[c.peers[i]] = &Progress{
+            0, raftLog.LastIndex() + 1,
+        }
+    }
 
     raft := Raft{
         id:               c.ID,
@@ -187,7 +194,6 @@ func newRaft(c *Config) *Raft {
         heartbeatTimeout: c.HeartbeatTick,
         electionTimeout:  c.ElectionTick,
     }
-    state, _, err := c.Storage.InitialState()
     if err != nil {
         log.Fatal(err.Error())
     }
@@ -209,9 +215,9 @@ func (r *Raft) sendAppend(to uint64) bool {
     // we will send message base on the peer' s next
     next := r.Prs[to].Next
     index := next - 1
-    logTerm, err := r.RaftLog.Term(index)
+    logTerm, _ := r.RaftLog.Term(index)
     lastIndex := r.RaftLog.LastIndex()
-    if index > lastIndex || err != nil {
+    if index > lastIndex {
         return false
     }
     message.Index = index

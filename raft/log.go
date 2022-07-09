@@ -16,8 +16,6 @@ package raft
 
 import (
     "errors"
-    "fmt"
-
     pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
     "github.com/pingcap/log"
 )
@@ -61,7 +59,7 @@ type RaftLog struct {
 func newLog(storage Storage) *RaftLog {
 
     raftLog := RaftLog{}
-
+    state, _, _ := storage.InitialState()
     lastIndex, err := storage.LastIndex()
     if err != nil {
         log.Fatal(err.Error())
@@ -71,7 +69,7 @@ func newLog(storage Storage) *RaftLog {
         log.Fatal(err.Error())
     }
     raftLog.stabled = lastIndex
-    raftLog.committed = firstIndex - 1
+    raftLog.committed = state.Commit
     raftLog.applied = firstIndex - 1
     raftLog.storage = storage
     entries, err := storage.Entries(firstIndex, lastIndex+1)
@@ -95,10 +93,11 @@ func (l *RaftLog) maybeCompact() {
 
 // unstableEntries return all the unstable entries
 func (l *RaftLog) unstableEntries() []pb.Entry {
-    if l.stabled >= l.LastIndex() {
+    if l.stabled >= l.LastIndex() || len(l.entries) == 0 {
         return []pb.Entry{}
     }
-    return l.entries[l.stabled:]
+    firstIndex := l.entries[0].Index
+    return l.entries[l.stabled-firstIndex+1:]
 }
 
 // nextEnts returns all the committed but not applied entries
@@ -146,8 +145,7 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
         return 0, nil
     }
     if l.lenEntries() == 0 {
-        term, _ := l.storage.Term(i)
-        return term, nil
+        return 0, nil
     }
     if i >= l.entries[0].Index+l.lenEntries() || i < l.entries[0].Index {
         return 0, errors.New("beyond the range")
@@ -159,9 +157,6 @@ func (l *RaftLog) Term(i uint64) (uint64, error) {
         }
         return term, nil
     } else {
-        if i-l.entries[0].Index > 1000 {
-            fmt.Println(i)
-        }
         return l.entries[i-l.entries[0].Index].Term, nil
     }
 }

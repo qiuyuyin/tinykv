@@ -161,7 +161,7 @@ func (rn *RawNode) Ready() Ready {
     ready.CommittedEntries = log.nextEnts()
     if len(raft.msgs) != 0 {
         ready.Messages = raft.msgs
-        raft.msgs = nil
+        raft.msgs = make([]pb.Message, 0)
     }
     if !isHardStateEqual(*raft.hardState(), rn.prevHardState) {
         ready.HardState = *raft.hardState()

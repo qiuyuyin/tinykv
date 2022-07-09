@@ -69,13 +69,13 @@ func (d *peerMsgHandler) process(entry eraftpb.Entry, kv *engine_util.WriteBatch
         }
         if termDif == 0 || indexDif == 0 {
             resp := d.processResp(req)
-            proposal.cb.Done(resp)
             d.proposals = d.proposals[1:]
             // For the snap command response
             // should set badger Txn to callback explicitly.
             if req.CmdType == raft_cmdpb.CmdType_Snap {
                 proposal.cb.Txn = d.peerStorage.Engines.Kv.NewTransaction(false)
             }
+            proposal.cb.Done(resp)
             break
         }
     }
@@ -106,7 +106,10 @@ func (d *peerMsgHandler) processResp(req *raft_cmdpb.Request) *raft_cmdpb.RaftCm
             Delete:  &raft_cmdpb.DeleteResponse{},
         }}
     case raft_cmdpb.CmdType_Snap:
-
+        resp.Responses = []*raft_cmdpb.Response{{
+            CmdType: raft_cmdpb.CmdType_Snap,
+            Snap:    &raft_cmdpb.SnapResponse{Region: d.Region()},
+        }}
     }
     return resp
 }
@@ -116,13 +119,13 @@ func (d *peerMsgHandler) HandleRaftReady() {
         return
     }
     // Your Code Here (2B).
-    if !d.RaftGroup.HasReady() {
+    if d.RaftGroup.HasReady() {
         ready := d.RaftGroup.Ready()
         d.peerStorage.SaveReadyState(&ready)
-
         d.Send(d.ctx.trans, ready.Messages)
         kvWB := &engine_util.WriteBatch{}
         for _, entry := range ready.CommittedEntries {
+            log.Infof("entry")
             kvWB = d.process(entry, kvWB)
             if entry.EntryType == eraftpb.EntryType_EntryConfChange {
                 var cc eraftpb.ConfChange
@@ -213,7 +216,7 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
     for _, req := range msg.Requests {
         data, err := req.Marshal()
         if err != nil {
-
+            log.Debug(err)
         }
         d.RaftGroup.Propose(data)
         // put the msg in the proposals
