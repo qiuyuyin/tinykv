@@ -597,7 +597,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
     // L: 1 1 2 3 4 5 6
     // F: 1 1 2 3
     if err != nil || m.Index == 0 {
-        fmt.Println()
+        //fmt.Println()
     }
 
     if li < m.Index || err != nil {
