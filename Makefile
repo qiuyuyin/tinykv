@@ -94,6 +94,15 @@ project2c:
 	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliableRecoverConcurrentPartition2C$ || true
 	$(TEST_CLEAN)
 
+project2d:
+	$(TEST_CLEAN)
+	$(GOTEST) ./kv/test_raftstore -run ^TestSnapshotUnreliableRecoverConcurrentPartition2C$ || true
+	$(TEST_CLEAN)
+
+project2e:
+	$(TEST_CLEAN)
+
+
 project3: project3a project3b project3c
 
 project3a:

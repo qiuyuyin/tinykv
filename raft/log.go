@@ -15,7 +15,7 @@
 package raft
 
 import (
-    "errors"
+    "fmt"
     pb "github.com/pingcap-incubator/tinykv/proto/pkg/eraftpb"
     "github.com/pingcap/log"
 )
@@ -57,7 +57,6 @@ type RaftLog struct {
 // newLog returns log using the given storage. It recovers the log
 // to the state that it just commits and applies the latest snapshot.
 func newLog(storage Storage) *RaftLog {
-
     raftLog := RaftLog{}
     state, _, _ := storage.InitialState()
     lastIndex, err := storage.LastIndex()
@@ -74,7 +73,7 @@ func newLog(storage Storage) *RaftLog {
     raftLog.storage = storage
     entries, err := storage.Entries(firstIndex, lastIndex+1)
     if err != nil {
-        log.Fatal(err.Error())
+        panic(err)
     }
     raftLog.entries = entries
     if err != nil {
@@ -88,7 +87,15 @@ func newLog(storage Storage) *RaftLog {
 // grow unlimitedly in memory
 func (l *RaftLog) maybeCompact() {
     // Your Code Here (2C).
-    l.storage.Snapshot()
+    //l.storage.Snapshot()
+    firstIndex, _ := l.storage.FirstIndex()
+    if len(l.entries) == 0 {
+        return
+    }
+    index := l.entries[0].Index
+    if firstIndex > index {
+        l.entries = l.entries[firstIndex-index:]
+    }
 }
 
 // unstableEntries return all the unstable entries
@@ -97,6 +104,9 @@ func (l *RaftLog) unstableEntries() []pb.Entry {
         return []pb.Entry{}
     }
     firstIndex := l.entries[0].Index
+    if l.stabled < firstIndex-1 {
+        return l.entries
+    }
     return l.entries[l.stabled-firstIndex+1:]
 }
 
@@ -107,6 +117,12 @@ func (l *RaftLog) nextEnts() (ents []pb.Entry) {
         return
     }
     firstIndex := l.entries[0].Index
+    if int(l.committed-firstIndex+1) < 0 || l.applied-firstIndex+1 > l.LastIndex() {
+        return
+    }
+    if l.applied > l.committed {
+        fmt.Println()
+    }
     ents = l.entries[l.applied+1-firstIndex : l.committed+1-firstIndex]
     return
 }
@@ -116,7 +132,10 @@ func (l *RaftLog) LastIndex() uint64 {
     if l.lenEntries() > 0 {
         return l.entries[0].Index + l.lenEntries() - 1
     } else {
+        if !IsEmptySnap(l.pendingSnapshot) {
+            return l.pendingSnapshot.Metadata.Index
 
+        }
         // find it from snap
         lastIndex, _ := l.storage.LastIndex()
         return lastIndex
@@ -141,22 +160,22 @@ func (l *RaftLog) splitEntries(i uint64) (ents []pb.Entry) {
 
 // Term return the term of the entry in the given index
 func (l *RaftLog) Term(i uint64) (uint64, error) {
-    if i == 0 {
-        return 0, nil
+    //fmt.Println(l.LastIndex())
+    if i > l.LastIndex() {
+        return 0, ErrUnavailable
     }
-    if l.lenEntries() == 0 {
-        return 0, nil
+    if l.lenEntries() == 0 && !IsEmptySnap(l.pendingSnapshot) {
+        return l.pendingSnapshot.Metadata.Term, nil
     }
-    if i >= l.entries[0].Index+l.lenEntries() || i < l.entries[0].Index {
-        return 0, errors.New("beyond the range")
-    }
-    if l.lenEntries() == 0 {
+    if l.lenEntries() == 0 || i < l.entries[0].Index {
         term, err := l.storage.Term(i)
-        if err != nil {
-            return 0, nil
+        if err == ErrUnavailable && !IsEmptySnap(l.pendingSnapshot) {
+            if i < l.pendingSnapshot.Metadata.Index {
+                err = ErrCompacted
+            }
         }
-        return term, nil
-    } else {
-        return l.entries[i-l.entries[0].Index].Term, nil
+        // this place we set the
+        return term, err
     }
+    return l.entries[i-l.entries[0].Index].Term, nil
 }

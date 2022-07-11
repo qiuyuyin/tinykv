@@ -40,13 +40,21 @@ func newPeerMsgHandler(peer *peer, ctx *GlobalContext) *peerMsgHandler {
         ctx:  ctx,
     }
 }
-
-func (d *peerMsgHandler) process(entry eraftpb.Entry, kv *engine_util.WriteBatch) *engine_util.WriteBatch {
-    req := &raft_cmdpb.Request{}
-    err := req.Unmarshal(entry.Data)
-    if err != nil {
+func (d *peerMsgHandler) processAdmin(msg *raft_cmdpb.RaftCmdRequest, kv *engine_util.WriteBatch) {
+    req := msg.AdminRequest
+    switch req.CmdType {
+    case raft_cmdpb.AdminCmdType_CompactLog:
+        compactLog := req.CompactLog
+        if compactLog.CompactIndex >= d.peerStorage.applyState.TruncatedState.Index {
+            d.peerStorage.applyState.TruncatedState.Index = compactLog.CompactIndex
+            d.peerStorage.applyState.TruncatedState.Term = compactLog.CompactTerm
+            kv.SetMeta(meta.ApplyStateKey(d.regionId), d.peerStorage.applyState)
+            d.ScheduleCompactLog(compactLog.CompactIndex)
+        }
 
     }
+}
+func (d *peerMsgHandler) process(req *raft_cmdpb.Request, entry eraftpb.Entry, kv *engine_util.WriteBatch) *engine_util.WriteBatch {
     switch req.CmdType {
     case raft_cmdpb.CmdType_Get:
     case raft_cmdpb.CmdType_Put:
@@ -121,12 +129,29 @@ func (d *peerMsgHandler) HandleRaftReady() {
     // Your Code Here (2B).
     if d.RaftGroup.HasReady() {
         ready := d.RaftGroup.Ready()
-        d.peerStorage.SaveReadyState(&ready)
+        result, err := d.peerStorage.SaveReadyState(&ready)
+        if err != nil {
+            return
+        }
+        if result != nil {
+            d.peerStorage.SetRegion(result.Region)
+            d.ctx.storeMeta.Lock()
+            d.ctx.storeMeta.regions[d.Region().Id] = d.Region()
+            d.ctx.storeMeta.Unlock()
+        }
         d.Send(d.ctx.trans, ready.Messages)
         kvWB := &engine_util.WriteBatch{}
         for _, entry := range ready.CommittedEntries {
-            log.Infof("entry")
-            kvWB = d.process(entry, kvWB)
+            msg := &raft_cmdpb.RaftCmdRequest{}
+            err := msg.Unmarshal(entry.Data)
+            if err != nil {
+                panic(err)
+            }
+            if msg.AdminRequest != nil {
+                d.processAdmin(msg, kvWB)
+            } else if len(msg.Requests) > 0 {
+                kvWB = d.process(msg.Requests[0], entry, kvWB)
+            }
             if entry.EntryType == eraftpb.EntryType_EntryConfChange {
                 var cc eraftpb.ConfChange
                 cc.Unmarshal(entry.Data)
@@ -141,7 +166,6 @@ func (d *peerMsgHandler) HandleRaftReady() {
         }
         d.RaftGroup.Advance(ready)
     }
-
 }
 
 func (d *peerMsgHandler) HandleMsg(msg message.Msg) {
@@ -213,19 +237,46 @@ func (d *peerMsgHandler) proposeRaftCommand(msg *raft_cmdpb.RaftCmdRequest, cb *
         return
     }
     // Your Code Here (2B).
-    for _, req := range msg.Requests {
-        data, err := req.Marshal()
-        if err != nil {
-            log.Debug(err)
+    if msg.AdminRequest != nil {
+        req := msg.AdminRequest
+        switch req.CmdType {
+        case raft_cmdpb.AdminCmdType_CompactLog:
+            data, err := msg.Marshal()
+            if err != nil {
+                panic(err)
+            }
+            d.RaftGroup.Propose(data)
         }
-        d.RaftGroup.Propose(data)
-        // put the msg in the proposals
-        d.proposals = append(d.proposals, &proposal{
-            index: d.RaftGroup.Raft.RaftLog.LastIndex(),
-            term:  d.RaftGroup.Raft.Term,
-            cb:    cb,
-        })
+        return
     }
+    // judge if the key is nil
+    request := msg.Requests[0]
+    var key []byte
+    switch request.CmdType {
+    case raft_cmdpb.CmdType_Get:
+        key = request.Get.Key
+    case raft_cmdpb.CmdType_Put:
+        key = request.Put.Key
+    case raft_cmdpb.CmdType_Delete:
+        key = request.Delete.Key
+    }
+    err = util.CheckKeyInRegion(key, d.Region())
+    if err != nil && request.CmdType != raft_cmdpb.CmdType_Snap {
+        cb.Done(ErrResp(err))
+    }
+
+    data, err := msg.Marshal()
+    if err != nil {
+        panic(err)
+    }
+    d.RaftGroup.Propose(data)
+    // put the msg in the proposals
+    d.proposals = append(d.proposals, &proposal{
+        index: d.RaftGroup.Raft.RaftLog.LastIndex(),
+        term:  d.Term(),
+        cb:    cb,
+    })
+
 }
 
 func (d *peerMsgHandler) onTick() {

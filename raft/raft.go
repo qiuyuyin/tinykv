@@ -17,6 +17,8 @@ package raft
 import (
     "bytes"
     "errors"
+    "fmt"
+    "github.com/pingcap-incubator/tinykv/kv/util"
     "github.com/pingcap/log"
     "math/rand"
     "sort"
@@ -215,13 +217,28 @@ func (r *Raft) sendAppend(to uint64) bool {
     // we will send message base on the peer' s next
     next := r.Prs[to].Next
     index := next - 1
-    logTerm, _ := r.RaftLog.Term(index)
+    logTerm, err := r.RaftLog.Term(index)
+    if err != nil {
+        if err == ErrCompacted {
+            snapshot, err := r.RaftLog.storage.Snapshot()
+            if err != nil {
+                return false
+            }
+            message.MsgType = pb.MessageType_MsgSnapshot
+            message.Snapshot = &snapshot
+            r.msgs = append(r.msgs, message)
+            // modify the peer's state
+            r.Prs[to].Next = snapshot.Metadata.Index + 1
+            return false
+        }
+    }
     lastIndex := r.RaftLog.LastIndex()
     if index > lastIndex {
         return false
     }
     message.Index = index
     message.LogTerm = logTerm
+
     // get entries, if the entries' length is 0, do not send the msg
     entries := r.RaftLog.splitEntries(index + 1)
     message.Entries = make([]*pb.Entry, len(entries))
@@ -230,7 +247,6 @@ func (r *Raft) sendAppend(to uint64) bool {
     }
     // set the commit
     message.Commit = r.RaftLog.committed
-
     r.msgs = append(r.msgs, message)
     // the first time
     return true
@@ -331,7 +347,6 @@ func (r *Raft) becomeLeader() {
     if len(r.Prs) == 1 {
         r.RaftLog.committed = r.RaftLog.LastIndex()
     }
-
 }
 
 // Step the entrance of handle message, see `MessageType`
@@ -346,7 +361,8 @@ func (r *Raft) Step(m pb.Message) error {
             return nil
         }
     } else if m.Term > r.Term {
-        if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat {
+        if m.MsgType == pb.MessageType_MsgAppend || m.MsgType == pb.MessageType_MsgHeartbeat ||
+            m.MsgType == pb.MessageType_MsgSnapshot {
             r.becomeFollower(m.Term, m.From)
         } else {
             r.becomeFollower(m.Term, 0)
@@ -416,6 +432,7 @@ func (r *Raft) Step(m pb.Message) error {
             }
             // put the entries into log
             r.appendEntries(entries...)
+            util.LogEntries(int(r.Lead), int(r.id), r.RaftLog.entries)
             if len(r.Prs) == 1 {
                 r.RaftLog.committed = r.RaftLog.LastIndex()
             }
@@ -471,7 +488,6 @@ func (r *Raft) Step(m pb.Message) error {
                 r.sendAppend(m.From)
             }
         }
-
     }
     return nil
 }
@@ -573,14 +589,18 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
     //    return
     //}
     li := r.RaftLog.LastIndex()
-    term, _ := r.RaftLog.Term(m.Index)
+    term, err := r.RaftLog.Term(m.Index)
     // li < index , li = 4 index = 6
     // the follower need send index = 4 back
     // I: 1 2 3 4 5 6 7
     //    - - - - - - -
     // L: 1 1 2 3 4 5 6
     // F: 1 1 2 3
-    if li < m.Index {
+    if err != nil || m.Index == 0 {
+        fmt.Println()
+    }
+
+    if li < m.Index || err != nil {
         message.Index = li
         lastTerm, _ := r.RaftLog.Term(li)
         message.LogTerm = lastTerm
@@ -615,6 +635,9 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
             }
             // when find the confict
             curIndex := v.Index - r.RaftLog.entries[0].Index
+            if v.Index < r.RaftLog.entries[0].Index {
+                fmt.Println(v.Index)
+            }
             curEntry := r.RaftLog.entries[curIndex]
             if bytes.Compare(curEntry.Data, v.Data) != 0 ||
                 curEntry.Term != v.Term {
@@ -640,6 +663,7 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
                 r.RaftLog.committed = m.Commit
             }
         }
+        util.LogEntries(int(r.Lead), int(r.id), r.RaftLog.entries)
     } else {
         message.Reject = true
         // logTerm , term not equal, logTerm = 6 and index = 7
@@ -661,6 +685,12 @@ func (r *Raft) handleAppendEntries(m pb.Message) {
             //    - - - - - - - -
             // L: 1 1 2 3 4 5 5 7
             // F: 1 1 2 3 6 6 6 6
+            if r.RaftLog.lenEntries() == 0 {
+                message.Index = r.RaftLog.applied
+                message.LogTerm = 0
+                r.msgs = append(r.msgs, message)
+                return
+            }
             curEntryIndex := int(m.Index - r.RaftLog.entries[0].Index)
             for i := curEntryIndex; i >= 0; i-- {
                 if r.RaftLog.entries[i].Term <= m.LogTerm {
@@ -746,6 +776,28 @@ func (r *Raft) handleVoteResponse(m pb.Message) {
 // handleSnapshot handle Snapshot RPC request
 func (r *Raft) handleSnapshot(m pb.Message) {
     // Your Code Here (2C).
+    //
+    meta := m.Snapshot.Metadata
+    if r.RaftLog.committed >= meta.Index {
+        return
+    }
+
+    if m.Term > r.Term {
+        r.becomeFollower(m.Term, m.From)
+    }
+
+    log := r.RaftLog
+    // restore the RaftLog
+    log.applied = meta.Index
+    log.committed = meta.Index
+    log.stabled = meta.Index
+    log.entries = nil
+    // update the pendingSnapshot util the node update it
+    log.pendingSnapshot = m.Snapshot
+    for _, peer := range meta.ConfState.Nodes {
+        r.Prs[peer] = &Progress{Match: 0, Next: meta.Index + 1}
+    }
+
 }
 
 // addNode add a new node to raft group
